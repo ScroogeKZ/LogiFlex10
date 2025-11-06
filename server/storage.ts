@@ -7,6 +7,8 @@ import {
   messages,
   notifications,
   sessions,
+  ettn,
+  digitalSignatures,
   type User,
   type UpsertUser,
   type UpdateUserProfile,
@@ -22,6 +24,10 @@ import {
   type InsertMessage,
   type Notification,
   type InsertNotification,
+  type ETTN,
+  type InsertETTN,
+  type DigitalSignature,
+  type InsertDigitalSignature,
 } from "@shared/schema";
 import { db } from "./db";
 import { eq, and, desc, sql } from "drizzle-orm";
@@ -68,6 +74,18 @@ export interface IStorage {
   markNotificationAsRead(id: string, userId: string): Promise<Notification>;
   markAllNotificationsAsRead(userId: string): Promise<void>;
   deleteNotification(id: string, userId: string): Promise<void>;
+  
+  // E-TTN operations
+  createETTN(ettnData: InsertETTN): Promise<ETTN>;
+  getETTN(id: string): Promise<ETTN | undefined>;
+  getETTNByTransaction(transactionId: string): Promise<ETTN | undefined>;
+  signETTN(id: string, userId: string, signatureData: string, certificateId: string): Promise<ETTN>;
+  updateETTNStatus(id: string, status: "draft" | "pending_signature" | "partially_signed" | "fully_signed" | "completed"): Promise<ETTN>;
+  
+  // Digital Signature operations
+  createDigitalSignature(signature: InsertDigitalSignature): Promise<DigitalSignature>;
+  getSignaturesForETTN(ettnId: string): Promise<DigitalSignature[]>;
+  validateSignature(id: string): Promise<boolean>;
   
   // Session operations
   getSession(sid: string): Promise<any | undefined>;
@@ -367,6 +385,145 @@ export class DatabaseStorage implements IStorage {
     await db
       .delete(notifications)
       .where(and(eq(notifications.id, id), eq(notifications.userId, userId)));
+  }
+
+  // E-TTN operations
+  async createETTN(ettnData: InsertETTN): Promise<ETTN> {
+    const ettnNumber = `ETTN-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+    
+    const [newETTN] = await db
+      .insert(ettn)
+      .values({ 
+        ...ettnData, 
+        ettnNumber,
+        status: "pending_signature"
+      })
+      .returning();
+    return newETTN;
+  }
+
+  async getETTN(id: string): Promise<ETTN | undefined> {
+    const [ettnRecord] = await db
+      .select()
+      .from(ettn)
+      .where(eq(ettn.id, id));
+    return ettnRecord;
+  }
+
+  async getETTNByTransaction(transactionId: string): Promise<ETTN | undefined> {
+    const [ettnRecord] = await db
+      .select()
+      .from(ettn)
+      .where(eq(ettn.transactionId, transactionId));
+    return ettnRecord;
+  }
+
+  async signETTN(id: string, userId: string, signatureData: string, certificateId: string): Promise<ETTN> {
+    const ettnRecord = await this.getETTN(id);
+    if (!ettnRecord) {
+      throw new Error("E-TTN not found");
+    }
+
+    const updates: any = { updatedAt: new Date() };
+    const currentDate = new Date();
+
+    if (ettnRecord.shipperId === userId && !ettnRecord.shipperSignature) {
+      updates.shipperSignature = signatureData;
+      updates.shipperSignedAt = currentDate;
+      
+      await this.createDigitalSignature({
+        ettnId: id,
+        userId,
+        signatureData,
+        certificateId,
+        isValid: true,
+        metadata: { role: "shipper" },
+      });
+    } else if (ettnRecord.carrierId === userId && !ettnRecord.carrierSignature) {
+      updates.carrierSignature = signatureData;
+      updates.carrierSignedAt = currentDate;
+      
+      await this.createDigitalSignature({
+        ettnId: id,
+        userId,
+        signatureData,
+        certificateId,
+        isValid: true,
+        metadata: { role: "carrier" },
+      });
+    }
+
+    const hasShipperSig = updates.shipperSignature || ettnRecord.shipperSignature;
+    const hasCarrierSig = updates.carrierSignature || ettnRecord.carrierSignature;
+
+    if (hasShipperSig && hasCarrierSig) {
+      updates.status = "fully_signed";
+      
+      await this.createNotification({
+        userId: ettnRecord.shipperId === userId ? ettnRecord.carrierId : ettnRecord.shipperId,
+        type: "status_update",
+        title: "е-ТТН полностью подписана",
+        message: `Электронная товарно-транспортная накладная ${ettnRecord.ettnNumber} подписана обеими сторонами`,
+        link: `/transactions/${ettnRecord.transactionId}`,
+      });
+      
+      await this.updateTransactionStatus(ettnRecord.transactionId, "in_transit");
+    } else if (hasShipperSig || hasCarrierSig) {
+      updates.status = "partially_signed";
+    }
+
+    const [updatedETTN] = await db
+      .update(ettn)
+      .set(updates)
+      .where(eq(ettn.id, id))
+      .returning();
+
+    return updatedETTN;
+  }
+
+  async updateETTNStatus(id: string, status: "draft" | "pending_signature" | "partially_signed" | "fully_signed" | "completed"): Promise<ETTN> {
+    const [updatedETTN] = await db
+      .update(ettn)
+      .set({ status, updatedAt: new Date() })
+      .where(eq(ettn.id, id))
+      .returning();
+    return updatedETTN;
+  }
+
+  // Digital Signature operations
+  async createDigitalSignature(signatureData: InsertDigitalSignature): Promise<DigitalSignature> {
+    const [newSignature] = await db
+      .insert(digitalSignatures)
+      .values(signatureData)
+      .returning();
+    return newSignature;
+  }
+
+  async getSignaturesForETTN(ettnId: string): Promise<DigitalSignature[]> {
+    return await db
+      .select()
+      .from(digitalSignatures)
+      .where(eq(digitalSignatures.ettnId, ettnId))
+      .orderBy(digitalSignatures.signedAt);
+  }
+
+  async validateSignature(id: string): Promise<boolean> {
+    const [signature] = await db
+      .select()
+      .from(digitalSignatures)
+      .where(eq(digitalSignatures.id, id));
+    
+    if (!signature) return false;
+    
+    if (signature.certificateExpiry && signature.certificateExpiry < new Date()) {
+      await db
+        .update(digitalSignatures)
+        .set({ isValid: false })
+        .where(eq(digitalSignatures.id, id));
+      return false;
+    }
+    
+    return signature.isValid ?? false;
   }
   
   // Session operations

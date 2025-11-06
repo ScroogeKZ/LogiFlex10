@@ -205,6 +205,15 @@ ISSUER_URL=https://replit.com/oidc
 - **2025-11-07**: Implemented responsive design for mobile devices (mobile menu, adaptive grids)
 - **2025-11-07**: Added dark theme support with ThemeProvider and theme toggle in Header
 - **2025-11-07**: Replaced loading spinners with skeleton loaders (StatsCardSkeleton, CargoCardSkeleton)
+- **2025-11-07**: ✅ Completed P1.1 - Mock ЭЦП Integration with E-TTN system
+  - Added E-TTN (electronic waybills) database schema with digitalSignatures table
+  - Implemented Mock EDS service for document signing simulation
+  - Created API endpoints: POST /api/ettn, GET /api/ettn/:id, PATCH /api/ettn/:id/sign, GET /api/transactions/:id/ettn
+  - Built ETTNCard UI component for viewing and signing E-TTN documents
+  - Automatic E-TTN creation when transaction status changes to "confirmed"
+  - Two-way notification system for E-TTN creation and full signing events
+  - Transaction status auto-advances to "in_transit" after both parties sign
+  - Server-side security: participant IDs derived from transaction data, preventing forgery
 
 ---
 

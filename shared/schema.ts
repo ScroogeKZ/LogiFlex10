@@ -224,3 +224,61 @@ export const insertNotificationSchema = createInsertSchema(notifications).omit({
 
 export type InsertNotification = z.infer<typeof insertNotificationSchema>;
 export type Notification = typeof notifications.$inferSelect;
+
+// E-TTN (Electronic Transport and Transit Note) for Kazakhstan compliance
+export const ettn = pgTable("ettn", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  transactionId: varchar("transaction_id").notNull().references(() => transactions.id),
+  ettnNumber: varchar("ettn_number").unique().notNull(),
+  cargoDescription: text("cargo_description").notNull(),
+  origin: varchar("origin").notNull(),
+  destination: varchar("destination").notNull(),
+  weight: decimal("weight", { precision: 10, scale: 2 }).notNull(),
+  shipperId: varchar("shipper_id").notNull().references(() => users.id),
+  carrierId: varchar("carrier_id").notNull().references(() => users.id),
+  shipperSignature: text("shipper_signature"),
+  carrierSignature: text("carrier_signature"),
+  shipperSignedAt: timestamp("shipper_signed_at"),
+  carrierSignedAt: timestamp("carrier_signed_at"),
+  status: varchar("status", { 
+    enum: ["draft", "pending_signature", "partially_signed", "fully_signed", "completed"] 
+  }).notNull().default("draft"),
+  metadata: jsonb("metadata"),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+
+export const insertETTNSchema = createInsertSchema(ettn).omit({
+  id: true,
+  ettnNumber: true,
+  shipperSignature: true,
+  carrierSignature: true,
+  shipperSignedAt: true,
+  carrierSignedAt: true,
+  createdAt: true,
+  updatedAt: true,
+});
+
+export type InsertETTN = z.infer<typeof insertETTNSchema>;
+export type ETTN = typeof ettn.$inferSelect;
+
+// Digital Signatures for E-TTN and documents
+export const digitalSignatures = pgTable("digital_signatures", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  ettnId: varchar("ettn_id").notNull().references(() => ettn.id),
+  userId: varchar("user_id").notNull().references(() => users.id),
+  signatureData: text("signature_data").notNull(),
+  certificateId: varchar("certificate_id").notNull(),
+  certificateExpiry: timestamp("certificate_expiry"),
+  signedAt: timestamp("signed_at").defaultNow(),
+  isValid: boolean("is_valid").default(true),
+  metadata: jsonb("metadata"),
+});
+
+export const insertDigitalSignatureSchema = createInsertSchema(digitalSignatures).omit({
+  id: true,
+  signedAt: true,
+});
+
+export type InsertDigitalSignature = z.infer<typeof insertDigitalSignatureSchema>;
+export type DigitalSignature = typeof digitalSignatures.$inferSelect;

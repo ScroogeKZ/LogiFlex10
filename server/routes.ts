@@ -2,9 +2,10 @@ import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { setupAuth, isAuthenticated } from "./replitAuth";
-import { insertCargoSchema, insertBidSchema, insertRWSMetricSchema, updateUserProfileSchema, insertMessageSchema, insertNotificationSchema } from "@shared/schema";
+import { insertCargoSchema, insertBidSchema, insertRWSMetricSchema, updateUserProfileSchema, insertMessageSchema, insertNotificationSchema, insertETTNSchema } from "@shared/schema";
 import { z } from "zod";
 import { autoUpdateRWSOnBidAccepted, autoUpdateRWSOnTransactionComplete, updateUserRWS } from "./rws-calculator";
+import { edsService } from "./eds-service";
 
 export async function registerRoutes(app: Express): Promise<Server> {
   await setupAuth(app);
@@ -322,6 +323,33 @@ export async function registerRoutes(app: Express): Promise<Server> {
       
       const updatedTransaction = await storage.updateTransactionStatus(req.params.id, status);
       
+      if (status === "confirmed") {
+        const existingETTN = await storage.getETTNByTransaction(req.params.id);
+        if (!existingETTN) {
+          const cargo = await storage.getCargo(updatedTransaction.cargoId);
+          if (cargo) {
+            const ettn = await storage.createETTN({
+              transactionId: req.params.id,
+              cargoDescription: cargo.description || cargo.title,
+              origin: cargo.origin,
+              destination: cargo.destination,
+              weight: cargo.weight,
+              shipperId: updatedTransaction.shipperId,
+              carrierId: updatedTransaction.carrierId,
+              status: "pending_signature",
+            });
+            
+            await storage.createNotification({
+              userId: updatedTransaction.shipperId === userId ? updatedTransaction.carrierId : updatedTransaction.shipperId,
+              type: "status_update",
+              title: "Создана е-ТТН",
+              message: `Автоматически создана электронная товарно-транспортная накладная ${ettn.ettnNumber}`,
+              link: `/transactions/${req.params.id}`,
+            });
+          }
+        }
+      }
+      
       if (status === "completed") {
         const cargo = await storage.getCargo(updatedTransaction.cargoId);
         if (cargo) {
@@ -522,6 +550,203 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error) {
       console.error("Error deleting notification:", error);
       res.status(500).json({ message: "Failed to delete notification" });
+    }
+  });
+
+  // E-TTN routes
+  app.post('/api/ettn', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const { transactionId } = req.body;
+      
+      if (!transactionId) {
+        return res.status(400).json({ message: "Transaction ID is required" });
+      }
+      
+      const transaction = await storage.getTransaction(transactionId);
+      if (!transaction) {
+        return res.status(404).json({ message: "Transaction not found" });
+      }
+      
+      if (transaction.shipperId !== userId && transaction.carrierId !== userId) {
+        return res.status(403).json({ message: "Not authorized to create E-TTN for this transaction" });
+      }
+      
+      const existingETTN = await storage.getETTNByTransaction(transactionId);
+      if (existingETTN) {
+        return res.status(400).json({ message: "E-TTN already exists for this transaction" });
+      }
+      
+      const cargo = await storage.getCargo(transaction.cargoId);
+      if (!cargo) {
+        return res.status(404).json({ message: "Cargo not found" });
+      }
+      
+      const ettnDataFromTransaction = {
+        transactionId,
+        cargoDescription: cargo.description || cargo.title,
+        origin: cargo.origin,
+        destination: cargo.destination,
+        weight: cargo.weight,
+        shipperId: transaction.shipperId,
+        carrierId: transaction.carrierId,
+        status: "pending_signature" as const,
+      };
+      
+      const ettn = await storage.createETTN(ettnDataFromTransaction);
+      
+      await storage.createNotification({
+        userId: transaction.shipperId === userId ? transaction.carrierId : transaction.shipperId,
+        type: "status_update",
+        title: "Создана е-ТТН",
+        message: `Создана электронная товарно-транспортная накладная ${ettn.ettnNumber}`,
+        link: `/transactions/${transactionId}`,
+      });
+      
+      res.json(ettn);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid E-TTN data", errors: error.errors });
+      }
+      console.error("Error creating E-TTN:", error);
+      res.status(500).json({ message: "Failed to create E-TTN" });
+    }
+  });
+
+  app.get('/api/ettn/:id', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const ettn = await storage.getETTN(req.params.id);
+      
+      if (!ettn) {
+        return res.status(404).json({ message: "E-TTN not found" });
+      }
+      
+      if (ettn.shipperId !== userId && ettn.carrierId !== userId) {
+        return res.status(403).json({ message: "Not authorized to view this E-TTN" });
+      }
+      
+      res.json(ettn);
+    } catch (error) {
+      console.error("Error fetching E-TTN:", error);
+      res.status(500).json({ message: "Failed to fetch E-TTN" });
+    }
+  });
+
+  app.get('/api/transactions/:id/ettn', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const transaction = await storage.getTransaction(req.params.id);
+      
+      if (!transaction) {
+        return res.status(404).json({ message: "Transaction not found" });
+      }
+      
+      if (transaction.shipperId !== userId && transaction.carrierId !== userId) {
+        return res.status(403).json({ message: "Not authorized to view E-TTN for this transaction" });
+      }
+      
+      const ettn = await storage.getETTNByTransaction(req.params.id);
+      if (!ettn) {
+        return res.status(404).json({ message: "E-TTN not found for this transaction" });
+      }
+      
+      res.json(ettn);
+    } catch (error) {
+      console.error("Error fetching E-TTN:", error);
+      res.status(500).json({ message: "Failed to fetch E-TTN" });
+    }
+  });
+
+  app.patch('/api/ettn/:id/sign', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      const ettn = await storage.getETTN(req.params.id);
+      
+      if (!ettn) {
+        return res.status(404).json({ message: "E-TTN not found" });
+      }
+      
+      if (ettn.shipperId !== userId && ettn.carrierId !== userId) {
+        return res.status(403).json({ message: "Not authorized to sign this E-TTN" });
+      }
+      
+      if (ettn.shipperId === userId && ettn.shipperSignature) {
+        return res.status(400).json({ message: "Shipper has already signed this E-TTN" });
+      }
+      
+      if (ettn.carrierId === userId && ettn.carrierSignature) {
+        return res.status(400).json({ message: "Carrier has already signed this E-TTN" });
+      }
+      
+      let certificateId = user?.edsCertId;
+      if (!certificateId) {
+        const mockCert = edsService.generateMockCertificate(
+          userId,
+          `${user?.firstName} ${user?.lastName}`,
+          user?.iin || "",
+          user?.bin || undefined
+        );
+        certificateId = mockCert.id;
+        
+        await storage.updateUserProfile(userId, {});
+      }
+      
+      const documentData = JSON.stringify({
+        ettnNumber: ettn.ettnNumber,
+        transactionId: ettn.transactionId,
+        cargo: ettn.cargoDescription,
+        route: `${ettn.origin} -> ${ettn.destination}`,
+        weight: ettn.weight,
+      });
+      
+      const signatureResult = await edsService.signDocument(documentData, certificateId);
+      
+      const updatedETTN = await storage.signETTN(
+        req.params.id,
+        userId,
+        signatureResult.signature,
+        certificateId
+      );
+      
+      if (updatedETTN.status === "fully_signed") {
+        await storage.updateTransactionStatus(ettn.transactionId, "in_transit");
+        
+        await storage.createNotification({
+          userId: ettn.shipperId === userId ? ettn.carrierId : ettn.shipperId,
+          type: "status_update",
+          title: "E-TTN Fully Signed",
+          message: `E-TTN ${ettn.ettnNumber} has been fully signed and the shipment is now in transit`,
+          link: `/transactions/${ettn.transactionId}`,
+        });
+      }
+      
+      res.json(updatedETTN);
+    } catch (error) {
+      console.error("Error signing E-TTN:", error);
+      res.status(500).json({ message: "Failed to sign E-TTN" });
+    }
+  });
+
+  app.get('/api/ettn/:id/signatures', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const ettn = await storage.getETTN(req.params.id);
+      
+      if (!ettn) {
+        return res.status(404).json({ message: "E-TTN not found" });
+      }
+      
+      if (ettn.shipperId !== userId && ettn.carrierId !== userId) {
+        return res.status(403).json({ message: "Not authorized to view signatures for this E-TTN" });
+      }
+      
+      const signatures = await storage.getSignaturesForETTN(req.params.id);
+      res.json(signatures);
+    } catch (error) {
+      console.error("Error fetching signatures:", error);
+      res.status(500).json({ message: "Failed to fetch signatures" });
     }
   });
 

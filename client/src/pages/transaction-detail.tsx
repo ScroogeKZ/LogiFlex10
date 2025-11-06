@@ -9,6 +9,7 @@ import Header from "@/components/Header";
 import Footer from "@/components/Footer";
 import TransactionTimeline from "@/components/TransactionTimeline";
 import TransactionChat from "@/components/TransactionChat";
+import ETTNCard from "@/components/ETTNCard";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -111,6 +112,35 @@ export default function TransactionDetailPage() {
       toast({
         title: "Ошибка",
         description: error.message || "Не удалось отправить оценку",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const { data: ettn } = useQuery<any>({
+    queryKey: ["/api/transactions", id, "ettn"],
+    enabled: !!id && !!transaction,
+    retry: false,
+  });
+
+  const createETTNMutation = useMutation({
+    mutationFn: async () => {
+      const res = await apiRequest("POST", "/api/ettn", {
+        transactionId: id,
+      });
+      return await res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/transactions", id, "ettn"] });
+      toast({
+        title: "е-ТТН создана",
+        description: "Электронная товарно-транспортная накладная успешно создана",
+      });
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Ошибка",
+        description: error.message || "Не удалось создать е-ТТН",
         variant: "destructive",
       });
     },
@@ -404,6 +434,14 @@ export default function TransactionDetailPage() {
                 </div>
               </CardContent>
             </Card>
+
+            <ETTNCard
+              ettn={ettn}
+              transactionId={transaction.id}
+              userId={currentUser?.id || ""}
+              isShipper={isShipper}
+              onCreateETTN={() => createETTNMutation.mutate()}
+            />
 
             <TransactionChat
               transactionId={transaction.id}
